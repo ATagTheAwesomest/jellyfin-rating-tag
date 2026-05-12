@@ -1,6 +1,6 @@
 // Jellyfin Rating Tag Overlay
 // Adds content rating badges (PG-13, R, TV-MA, etc.) to media cards.
-// Inserts into the je-tag-host container created by Jellyfin Enhanced.
+// Inserts into the card's own scalable image container.
 
 (function () {
     'use strict';
@@ -12,7 +12,7 @@
     const RATING_LABEL_CLASS = 'rating-overlay-label';
 
     // Track processed cards to avoid duplicates
-    const processedCards = new WeakSet();
+    let processedCards = new WeakSet();
     // Batch queue for API requests
     let pendingItems = [];
     let batchTimer = null;
@@ -23,6 +23,46 @@
 
     function logWarn(...args) {
         console.warn(LOG_PREFIX, ...args);
+    }
+
+    function injectStyleOnce() {
+        if (document.getElementById('je-rating-tag-style')) return;
+
+        const style = document.createElement('style');
+        style.id = 'je-rating-tag-style';
+        style.textContent = [
+            '.rating-overlay-container {',
+            '  z-index: 2;',
+            '  transition: opacity 0.15s ease;',
+            '  pointer-events: none;',
+            '}',
+            // Hide badge when card overlay states are active (hover/focus/selected style modes)
+            '.card:hover .rating-overlay-container,',
+            '.card:focus-within .rating-overlay-container,',
+            '.cardBox:hover .rating-overlay-container,',
+            '.cardBox:focus-within .rating-overlay-container,',
+            '.card.selected .rating-overlay-container,',
+            '.cardBox.selected .rating-overlay-container,',
+            '.card[data-selected="true"] .rating-overlay-container,',
+            '.cardBox[data-selected="true"] .rating-overlay-container {',
+            '  opacity: 0 !important;',
+            '}',
+        ].join('\n');
+
+        document.head.appendChild(style);
+    }
+
+    function resetForNavigation() {
+        // Reset in-memory state so existing/reused card nodes can be processed again.
+        processedCards = new WeakSet();
+        pendingItems = [];
+        batchTimer = null;
+
+        // Remove existing overlays so they can be reattached after navigation/render cycles.
+        const existing = document.querySelectorAll('.' + RATING_CONTAINER_CLASS);
+        for (const node of existing) {
+            node.remove();
+        }
     }
 
     log('Script loaded');
@@ -129,7 +169,7 @@
         for (const entry of batch) {
             const rating = ratingMap[entry.itemId];
             if (rating) {
-                insertRatingOverlay(entry.tagHost, rating);
+                insertRatingOverlay(entry.anchor, rating);
             }
         }
 
@@ -139,8 +179,8 @@
         }
     }
 
-    function queueForProcessing(tagHost, itemId) {
-        pendingItems.push({ tagHost, itemId });
+    function queueForProcessing(anchor, itemId) {
+        pendingItems.push({ anchor, itemId });
 
         if (!batchTimer) {
             batchTimer = setTimeout(() => {
@@ -151,13 +191,15 @@
     }
 
     // ─── Insert Rating Overlay ───────────────────────────────────────────────
-    function insertRatingOverlay(tagHost, rating) {
-        // Check if already has rating overlay
-        if (tagHost.querySelector('.' + RATING_CONTAINER_CLASS)) return;
+    function insertRatingOverlay(anchor, rating) {
+        if (anchor.querySelector('.' + RATING_CONTAINER_CLASS)) return;
+
+        if (!anchor.style.position) {
+            anchor.style.position = 'relative';
+        }
 
         const container = document.createElement('div');
         container.className = RATING_CONTAINER_CLASS;
-        container.style.cssText = 'position: absolute; top: 6px; left: 6px;';
 
         const label = document.createElement('div');
         label.className = RATING_LABEL_CLASS;
@@ -195,10 +237,27 @@
             text-transform: uppercase;
             letter-spacing: 0.5px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+            opacity: 0.7;
         `;
 
         container.appendChild(label);
-        tagHost.appendChild(container);
+
+        const indicators = anchor.querySelector('.cardIndicators');
+        const countIndicator = indicators && indicators.querySelector('.countIndicator');
+
+        if (indicators && countIndicator) {
+            indicators.style.display = 'flex';
+            indicators.style.alignItems = 'flex-start';
+            indicators.style.justifyContent = 'flex-end';
+            indicators.style.gap = '6px';
+
+            container.style.cssText = 'position: static; display: inline-flex; align-items: center;';
+            indicators.insertBefore(container, countIndicator);
+            return;
+        }
+
+        container.style.cssText = 'position: absolute; top: 6px; right: 6px;';
+        anchor.appendChild(container);
     }
 
     // ─── Process Card ────────────────────────────────────────────────────────
@@ -208,15 +267,13 @@
             return;
         }
 
-        // Find the je-tag-host container (created by Jellyfin Enhanced)
-        const tagHost = card.querySelector('.je-tag-host');
-        if (!tagHost) {
-            logWarn('No .je-tag-host found in card', card);
+        const anchor = card.querySelector('.cardScalable');
+        if (!anchor) {
+            logWarn('No .cardScalable found in card', card);
             return;
         }
 
-        // Check if already has rating
-        if (tagHost.querySelector('.' + RATING_CONTAINER_CLASS)) {
+        if (anchor.querySelector('.' + RATING_CONTAINER_CLASS)) {
             log('Rating overlay already present');
             return;
         }
@@ -229,27 +286,15 @@
 
         processedCards.add(card);
         log('Queueing card for processing, itemId:', itemId);
-        queueForProcessing(tagHost, itemId);
+        queueForProcessing(anchor, itemId);
     }
 
     // ─── Scan Page for Cards ─────────────────────────────────────────────────
     function scanForCards() {
-        const cards = document.querySelectorAll('.card, .cardBox');
+        const cards = document.querySelectorAll('.card');
         for (const card of cards) {
             processCard(card);
         }
-    }
-
-    // ─── Find Ancestor Card ──────────────────────────────────────────────────
-    function findParentCard(el) {
-        let node = el.parentElement;
-        while (node) {
-            if (node.classList && (node.classList.contains('card') || node.classList.contains('cardBox'))) {
-                return node;
-            }
-            node = node.parentElement;
-        }
-        return null;
     }
 
     // ─── Mutation Observer ───────────────────────────────────────────────────
@@ -259,31 +304,10 @@
             if (m.addedNodes.length > 0) {
                 for (const node of m.addedNodes) {
                     if (node.nodeType === 1) {
-                        // If je-tag-host was just injected by Jellyfin Enhanced, process its parent card
-                        if (node.classList && node.classList.contains('je-tag-host')) {
-                            const parentCard = findParentCard(node);
-                            if (parentCard) {
-                                // Remove from processed set so processCard will re-evaluate it
-                                processedCards.delete(parentCard);
-                                processCard(parentCard);
-                            }
-                        } else if (node.querySelector) {
-                            // Also catch je-tag-host injected deeper inside a newly added subtree
-                            const tagHosts = node.querySelectorAll('.je-tag-host');
-                            for (const host of tagHosts) {
-                                const parentCard = findParentCard(host);
-                                if (parentCard) {
-                                    processedCards.delete(parentCard);
-                                    processCard(parentCard);
-                                }
-                            }
-                        }
-
-                        // Check if it's a card or contains cards
-                        if (node.classList && (node.classList.contains('card') || node.classList.contains('cardBox'))) {
+                        if (node.classList && node.classList.contains('card')) {
                             processCard(node);
                         } else if (node.querySelector) {
-                            const cards = node.querySelectorAll('.card, .cardBox');
+                            const cards = node.querySelectorAll('.card');
                             if (cards.length > 0) shouldScan = true;
                         }
                     }
@@ -302,17 +326,24 @@
     function poll() {
         const currentHash = window.location.hash;
         if (currentHash !== lastHash) {
+            log('Hash changed:', lastHash, '->', currentHash);
             lastHash = currentHash;
+            resetForNavigation();
+            // Retry twice to catch delayed card/tag-host rendering after SPA navigation.
             setTimeout(scanForCards, 500);
+            setTimeout(scanForCards, 1500);
         }
         setTimeout(poll, POLL_INTERVAL);
     }
 
     // ─── Initialize ──────────────────────────────────────────────────────────
+    injectStyleOnce();
+
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         setTimeout(scanForCards, 1000);
     } else {
         document.addEventListener('DOMContentLoaded', function () {
+            injectStyleOnce();
             setTimeout(scanForCards, 1000);
         });
     }
